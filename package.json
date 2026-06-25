@@ -1,0 +1,19 @@
+{
+  "name": "vmware-workstation-mcp",
+  "version": "0.1.0",
+  "description": "MCP stdio server for VMware Workstation via vmrun.",
+  "type": "module",
+  "bin": {
+    "vmware-workstation-mcp": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node ./src/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "file:./modelcontextprotocol-sdk-1.29.0.tgz",
+    "zod": "4.1.13"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
