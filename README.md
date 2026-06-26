@@ -13,6 +13,7 @@ npm install
 `vmrun.exe` が標準の VMware Workstation インストール先にあれば自動検出します。見つからない場合は `VMRUN_PATH` を指定してください。
 `vmrun` の product type は既定で VMware Workstation の `ws` を使います。変更したい場合は `VMRUN_TYPE` を指定してください。
 WSL で `vmrun.exe` を使う場合は、既定で Windows PowerShell 経由で実行します。直接実行したい場合は `VMRUN_USE_POWERSHELL=0` を指定してください。
+WSL 側 Node.js から Windows exe を直接起動できない環境では、Windows 側で `vmrun` bridge を起動し、WSL 側 MCP サーバーから `VMRUN_BRIDGE_URL` で接続してください。
 
 WSL から起動する例:
 
@@ -28,6 +29,22 @@ $env:VMRUN_PATH = "C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe"
 npm start
 ```
 
+Windows 側で bridge だけ起動し、MCP サーバーは WSL 側で動かす例:
+
+```powershell
+$env:VMRUN_BRIDGE_TOKEN = "change-me"
+$env:VMRUN_PATH = "C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe"
+npm run bridge
+```
+
+```bash
+export VMRUN_BRIDGE_URL="http://127.0.0.1:57931/"
+export VMRUN_BRIDGE_TOKEN="change-me"
+npm start
+```
+
+`VMRUN_BRIDGE_HOST` と `VMRUN_BRIDGE_PORT` で bridge の listen 先を変更できます。既定は `127.0.0.1:57931` です。
+
 ## MCP クライアント設定例
 
 WSL 側の Node.js で起動する場合:
@@ -40,6 +57,23 @@ WSL 側の Node.js で起動する場合:
       "args": ["/path/to/vmware-workstation-mcp/src/index.js"],
       "env": {
         "VMRUN_PATH": "/mnt/c/Program Files (x86)/VMware/VMware Workstation/vmrun.exe"
+      }
+    }
+  }
+}
+```
+
+Windows bridge を使う場合の WSL 側 MCP 設定例:
+
+```json
+{
+  "mcpServers": {
+    "vmware-workstation": {
+      "command": "node",
+      "args": ["/path/to/vmware-workstation-mcp/src/index.js"],
+      "env": {
+        "VMRUN_BRIDGE_URL": "http://127.0.0.1:57931/",
+        "VMRUN_BRIDGE_TOKEN": "change-me"
       }
     }
   }

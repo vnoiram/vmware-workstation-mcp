@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { access, readFile, readdir, stat } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { constants as fsConstants } from "node:fs";
 import { homedir, platform } from "node:os";
 import { basename, delimiter, dirname, join, sep } from "node:path";
@@ -10,13 +11,24 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import * as z from "zod/v4";
 
 const isWindows = platform() === "win32";
-const isWsl = !isWindows && Boolean(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP);
+const isWsl = !isWindows && detectWsl();
 
 const SOFT_HARD = z.enum(["soft", "hard"]);
 const GUEST_CREDENTIALS = {
   guestUser: z.string().min(1).describe("Guest OS username."),
   guestPassword: z.string().min(1).describe("Guest OS password.")
 };
+
+function detectWsl() {
+  if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) {
+    return true;
+  }
+  try {
+    return readFileSync("/proc/version", "utf8").toLowerCase().includes("microsoft");
+  } catch {
+    return false;
+  }
+}
 
 function text(content) {
   return { content: [{ type: "text", text: typeof content === "string" ? content : JSON.stringify(content, null, 2) }] };
@@ -71,7 +83,8 @@ function executableCandidates() {
 async function canExecute(path) {
   if (path.includes(sep) || path.includes("/")) {
     try {
-      await access(path, fsConstants.X_OK);
+      const mode = path.toLowerCase().endsWith(".exe") ? fsConstants.F_OK : fsConstants.X_OK;
+      await access(path, mode);
       return true;
     } catch {
       return false;
@@ -114,8 +127,46 @@ function quotePowershell(value) {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
+function quoteShell(value) {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
 function redactVmrunArgs(args) {
   return args.map((arg, index) => args[index - 1] === "-gp" ? "[redacted]" : arg);
+}
+
+function bridgeUrl() {
+  return process.env.VMRUN_BRIDGE_URL;
+}
+
+async function runVmrunBridge(args, options = {}) {
+  const url = bridgeUrl();
+  if (!url) {
+    throw new Error("VMRUN_BRIDGE_URL is not set.");
+  }
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(process.env.VMRUN_BRIDGE_TOKEN ? { authorization: `Bearer ${process.env.VMRUN_BRIDGE_TOKEN}` } : {})
+    },
+    body: JSON.stringify({
+      args,
+      timeoutMs: options.timeoutMs ?? Number(process.env.VMRUN_TIMEOUT_MS ?? 120000)
+    })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.ok === false) {
+    const message = payload.error || `vmrun bridge returned HTTP ${response.status}`;
+    throw new Error(message);
+  }
+  return {
+    code: payload.code ?? 0,
+    stdout: payload.stdout ?? "",
+    stderr: payload.stderr ?? "",
+    command: payload.command ?? ["vmrun", ...redactVmrunArgs(args)]
+  };
 }
 
 function vmrunInvocation(vmrun, args) {
@@ -127,16 +178,22 @@ function vmrunInvocation(vmrun, args) {
   const vmrunWindowsPath = pathForVmrun(vmrun);
   const command = `& ${[vmrunWindowsPath, ...args].map(quotePowershell).join(" ")}; exit $LASTEXITCODE`;
   const displayCommand = `& ${[vmrunWindowsPath, ...displayArgs].map(quotePowershell).join(" ")}; exit $LASTEXITCODE`;
+  const powershellArgs = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command];
+  const shellCommand = [powershellPath(), ...powershellArgs].map(quoteShell).join(" ");
   return {
-    command: powershellPath(),
-    args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+    command: "/bin/sh",
+    args: ["-lc", shellCommand],
     display: [powershellPath(), "-Command", displayCommand]
   };
 }
 
 async function runVmrun(args, options = {}) {
-  const vmrun = await resolveVmrun();
   const finalArgs = vmrunArgs(args);
+  if (bridgeUrl()) {
+    return await runVmrunBridge(finalArgs, options);
+  }
+
+  const vmrun = await resolveVmrun();
   const invocation = vmrunInvocation(vmrun, finalArgs);
   const displayArgs = redactVmrunArgs(finalArgs);
   const timeoutMs = options.timeoutMs ?? Number(process.env.VMRUN_TIMEOUT_MS ?? 120000);
@@ -322,15 +379,16 @@ server.registerTool("server_info", {
   annotations: { readOnlyHint: true, openWorldHint: false }
 }, async () => {
   try {
-    const vmrun = await resolveVmrun();
+    const vmrun = bridgeUrl() ? undefined : await resolveVmrun();
     return text({
       vmrun,
+      bridgeUrl: bridgeUrl(),
       isWsl,
       isWindows,
       searchRoots: configuredRoots(),
       vmrunType: process.env.VMRUN_TYPE ?? "ws",
-      vmrunUsePowershell: usePowershellBridge(vmrun),
-      powershellPath: usePowershellBridge(vmrun) ? powershellPath() : undefined,
+      vmrunUsePowershell: vmrun ? usePowershellBridge(vmrun) : false,
+      powershellPath: vmrun && usePowershellBridge(vmrun) ? powershellPath() : undefined,
       vmrunTimeoutMs: Number(process.env.VMRUN_TIMEOUT_MS ?? 120000)
     });
   } catch (error) {
