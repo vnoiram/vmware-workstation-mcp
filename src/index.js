@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
-import { access, readdir, stat } from "node:fs/promises";
+import { access, readFile, readdir, stat } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { homedir, platform } from "node:os";
-import { delimiter, join, sep } from "node:path";
+import { basename, delimiter, dirname, join, sep } from "node:path";
 import { spawn } from "node:child_process";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -13,6 +13,10 @@ const isWindows = platform() === "win32";
 const isWsl = !isWindows && Boolean(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP);
 
 const SOFT_HARD = z.enum(["soft", "hard"]);
+const GUEST_CREDENTIALS = {
+  guestUser: z.string().min(1).describe("Guest OS username."),
+  guestPassword: z.string().min(1).describe("Guest OS password.")
+};
 
 function text(content) {
   return { content: [{ type: "text", text: typeof content === "string" ? content : JSON.stringify(content, null, 2) }] };
@@ -87,12 +91,58 @@ async function resolveVmrun() {
   );
 }
 
+function vmrunArgs(args) {
+  const vmrunType = process.env.VMRUN_TYPE ?? "ws";
+  return vmrunType ? ["-T", vmrunType, ...args] : args;
+}
+
+function powershellPath() {
+  return process.env.POWERSHELL_PATH ?? "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+}
+
+function usePowershellBridge(vmrun) {
+  if (!isWsl) {
+    return false;
+  }
+  if (process.env.VMRUN_USE_POWERSHELL) {
+    return !["0", "false", "no"].includes(process.env.VMRUN_USE_POWERSHELL.toLowerCase());
+  }
+  return vmrun.toLowerCase().endsWith(".exe");
+}
+
+function quotePowershell(value) {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+function redactVmrunArgs(args) {
+  return args.map((arg, index) => args[index - 1] === "-gp" ? "[redacted]" : arg);
+}
+
+function vmrunInvocation(vmrun, args) {
+  const displayArgs = redactVmrunArgs(args);
+  if (!usePowershellBridge(vmrun)) {
+    return { command: vmrun, args, display: [vmrun, ...displayArgs] };
+  }
+
+  const vmrunWindowsPath = pathForVmrun(vmrun);
+  const command = `& ${[vmrunWindowsPath, ...args].map(quotePowershell).join(" ")}; exit $LASTEXITCODE`;
+  const displayCommand = `& ${[vmrunWindowsPath, ...displayArgs].map(quotePowershell).join(" ")}; exit $LASTEXITCODE`;
+  return {
+    command: powershellPath(),
+    args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+    display: [powershellPath(), "-Command", displayCommand]
+  };
+}
+
 async function runVmrun(args, options = {}) {
   const vmrun = await resolveVmrun();
+  const finalArgs = vmrunArgs(args);
+  const invocation = vmrunInvocation(vmrun, finalArgs);
+  const displayArgs = redactVmrunArgs(finalArgs);
   const timeoutMs = options.timeoutMs ?? Number(process.env.VMRUN_TIMEOUT_MS ?? 120000);
 
   return await new Promise((resolve, reject) => {
-    const child = spawn(vmrun, args, {
+    const child = spawn(invocation.command, invocation.args, {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -100,7 +150,7 @@ async function runVmrun(args, options = {}) {
     let stderr = "";
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
-      reject(new Error(`vmrun timed out after ${timeoutMs} ms: ${args.join(" ")}`));
+      reject(new Error(`vmrun timed out after ${timeoutMs} ms: ${displayArgs.join(" ")}`));
     }, timeoutMs);
 
     child.stdout.setEncoding("utf8");
@@ -117,13 +167,13 @@ async function runVmrun(args, options = {}) {
     });
     child.on("close", code => {
       clearTimeout(timer);
-      const result = { code, stdout: stdout.trim(), stderr: stderr.trim(), command: [vmrun, ...args] };
+      const result = { code, stdout: stdout.trim(), stderr: stderr.trim(), command: invocation.display };
       if (code === 0) {
         resolve(result);
         return;
       }
       const detail = [result.stderr, result.stdout].filter(Boolean).join("\n");
-      reject(new Error(`vmrun exited with code ${code}: ${args.join(" ")}${detail ? `\n${detail}` : ""}`));
+      reject(new Error(`vmrun exited with code ${code}: ${displayArgs.join(" ")}${detail ? `\n${detail}` : ""}`));
     });
   });
 }
@@ -144,6 +194,43 @@ function parseSnapshots(output) {
     .filter(line => !line.toLowerCase().startsWith("total snapshots:"));
 }
 
+function parseVmx(text) {
+  const config = {};
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    const match = /^([^=]+?)\s*=\s*"(.*)"\s*$/.exec(trimmed);
+    if (match) {
+      config[match[1].trim()] = match[2].replace(/\\"/g, "\"");
+    }
+  }
+  return config;
+}
+
+function vmSummary(vmxPath, runningVms = []) {
+  const hostPath = isWsl ? windowsPathToWsl(vmxPath) : vmxPath;
+  return {
+    name: basename(hostPath, ".vmx"),
+    hostPath,
+    vmrunPath: pathForVmrun(hostPath),
+    directory: dirname(hostPath),
+    running: runningVms.includes(pathForVmrun(hostPath)) || runningVms.includes(hostPath)
+  };
+}
+
+function guestAuthArgs({ guestUser, guestPassword }) {
+  return ["-gu", guestUser, "-gp", guestPassword];
+}
+
+function parseGuestDirectory(output) {
+  return output
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+}
+
 function configuredRoots() {
   if (process.env.VMWARE_VMX_ROOTS) {
     return process.env.VMWARE_VMX_ROOTS.split(delimiter).filter(Boolean);
@@ -156,6 +243,9 @@ function configuredRoots() {
   ];
   if (isWsl) {
     roots.push("/mnt/c/Users");
+    for (const drive of ["d", "e"]) {
+      roots.push(`/mnt/${drive}/Virtual Machines`, `/mnt/${drive}/VMs`, `/mnt/${drive}/vmware`);
+    }
   }
   return roots;
 }
@@ -208,6 +298,15 @@ async function discoverVms(roots, maxDepth) {
   return [...new Set(results)].sort();
 }
 
+async function safeListRunningVms() {
+  try {
+    const result = await runVmrun(["list"]);
+    return parseRunningVms(result.stdout);
+  } catch {
+    return [];
+  }
+}
+
 function vmxSchema(description = "Path to a .vmx file. WSL /mnt/c paths are accepted.") {
   return z.string().min(1).describe(description);
 }
@@ -229,6 +328,9 @@ server.registerTool("server_info", {
       isWsl,
       isWindows,
       searchRoots: configuredRoots(),
+      vmrunType: process.env.VMRUN_TYPE ?? "ws",
+      vmrunUsePowershell: usePowershellBridge(vmrun),
+      powershellPath: usePowershellBridge(vmrun) ? powershellPath() : undefined,
       vmrunTimeoutMs: Number(process.env.VMRUN_TIMEOUT_MS ?? 120000)
     });
   } catch (error) {
@@ -247,7 +349,52 @@ server.registerTool("find_vms", {
 }, async ({ roots, maxDepth }) => {
   const scanRoots = roots?.length ? roots : configuredRoots();
   const vms = await discoverVms(scanRoots, maxDepth);
-  return text({ roots: scanRoots, count: vms.length, vms });
+  const runningVms = await safeListRunningVms();
+  return text({ roots: scanRoots, count: vms.length, vms: vms.map(vmxPath => vmSummary(vmxPath, runningVms)) });
+});
+
+server.registerTool("get_vm_status", {
+  title: "Get VM Status",
+  description: "Show whether a VM is running and return basic path information.",
+  inputSchema: { vmxPath: vmxSchema() },
+  annotations: { readOnlyHint: true, openWorldHint: false }
+}, async ({ vmxPath }) => {
+  try {
+    const result = await runVmrun(["list"]);
+    const runningVms = parseRunningVms(result.stdout);
+    return text({ ...vmSummary(vmxPath, runningVms), runningVms });
+  } catch (error) {
+    return toolError(error);
+  }
+});
+
+server.registerTool("read_vmx_config", {
+  title: "Read VMX Config",
+  description: "Read selected metadata from a VMX file without starting the VM.",
+  inputSchema: {
+    vmxPath: vmxSchema(),
+    includeAll: z.boolean().default(false).describe("Return all parsed VMX keys. Defaults to a concise summary.")
+  },
+  annotations: { readOnlyHint: true, openWorldHint: false }
+}, async ({ vmxPath, includeAll }) => {
+  try {
+    const hostPath = isWsl ? windowsPathToWsl(vmxPath) : vmxPath;
+    const raw = await readFile(hostPath, "utf8");
+    const config = parseVmx(raw);
+    const summary = {
+      displayName: config.displayName,
+      guestOS: config.guestOS,
+      memsize: config.memsize,
+      numvcpus: config.numvcpus,
+      firmware: config.firmware,
+      ethernet0ConnectionType: config["ethernet0.connectionType"],
+      hostPath,
+      vmrunPath: pathForVmrun(hostPath)
+    };
+    return text(includeAll ? { summary, config } : summary);
+  } catch (error) {
+    return toolError(error);
+  }
 });
 
 server.registerTool("list_running_vms", {
@@ -425,6 +572,211 @@ server.registerTool("delete_snapshot", {
 }, async ({ vmxPath, name }) => {
   try {
     const result = await runVmrun(["deleteSnapshot", pathForVmrun(vmxPath), name]);
+    return text({ ok: true, stdout: result.stdout });
+  } catch (error) {
+    return toolError(error);
+  }
+});
+
+server.registerTool("guest_run_program", {
+  title: "Run Program In Guest",
+  description: "Run a program inside the guest OS through VMware Tools.",
+  inputSchema: {
+    vmxPath: vmxSchema(),
+    ...GUEST_CREDENTIALS,
+    programPath: z.string().min(1).describe("Program path inside the guest OS."),
+    arguments: z.array(z.string()).default([]).describe("Arguments passed to the guest program."),
+    noWait: z.boolean().default(false).describe("Return before the guest process exits."),
+    activeWindow: z.boolean().default(false).describe("Run with an active window where supported."),
+    interactive: z.boolean().default(false).describe("Run interactively where supported."),
+    timeoutMs: z.number().int().min(1000).max(900000).optional()
+  },
+  annotations: { destructiveHint: true, openWorldHint: false }
+}, async ({ vmxPath, guestUser, guestPassword, programPath, arguments: programArgs, noWait, activeWindow, interactive, timeoutMs }) => {
+  try {
+    const flags = [];
+    if (noWait) {
+      flags.push("-noWait");
+    }
+    if (activeWindow) {
+      flags.push("-activeWindow");
+    }
+    if (interactive) {
+      flags.push("-interactive");
+    }
+    const result = await runVmrun([
+      ...guestAuthArgs({ guestUser, guestPassword }),
+      "runProgramInGuest",
+      pathForVmrun(vmxPath),
+      ...flags,
+      programPath,
+      ...programArgs
+    ], { timeoutMs });
+    return text({ ok: true, stdout: result.stdout, stderr: result.stderr });
+  } catch (error) {
+    return toolError(error);
+  }
+});
+
+server.registerTool("guest_list_processes", {
+  title: "List Guest Processes",
+  description: "List processes inside the guest OS through VMware Tools.",
+  inputSchema: {
+    vmxPath: vmxSchema(),
+    ...GUEST_CREDENTIALS
+  },
+  annotations: { readOnlyHint: true, openWorldHint: false }
+}, async ({ vmxPath, guestUser, guestPassword }) => {
+  try {
+    const result = await runVmrun([
+      ...guestAuthArgs({ guestUser, guestPassword }),
+      "listProcessesInGuest",
+      pathForVmrun(vmxPath)
+    ]);
+    return text({ raw: result.stdout });
+  } catch (error) {
+    return toolError(error);
+  }
+});
+
+server.registerTool("capture_screen", {
+  title: "Capture Screen",
+  description: "Capture the VM screen to a host image file.",
+  inputSchema: {
+    vmxPath: vmxSchema(),
+    hostPath: z.string().min(1).describe("Destination image path on the host. WSL /mnt/c paths are accepted.")
+  },
+  annotations: { readOnlyHint: true, openWorldHint: false }
+}, async ({ vmxPath, hostPath }) => {
+  try {
+    const result = await runVmrun(["captureScreen", pathForVmrun(vmxPath), pathForVmrun(hostPath)]);
+    return text({ ok: true, hostPath, vmrunHostPath: pathForVmrun(hostPath), stdout: result.stdout });
+  } catch (error) {
+    return toolError(error);
+  }
+});
+
+server.registerTool("guest_list_directory", {
+  title: "List Guest Directory",
+  description: "List a directory inside the guest OS through VMware Tools.",
+  inputSchema: {
+    vmxPath: vmxSchema(),
+    ...GUEST_CREDENTIALS,
+    guestPath: z.string().min(1).describe("Directory path inside the guest OS.")
+  },
+  annotations: { readOnlyHint: true, openWorldHint: false }
+}, async ({ vmxPath, guestUser, guestPassword, guestPath }) => {
+  try {
+    const result = await runVmrun([
+      ...guestAuthArgs({ guestUser, guestPassword }),
+      "listDirectoryInGuest",
+      pathForVmrun(vmxPath),
+      guestPath
+    ]);
+    return text({ entries: parseGuestDirectory(result.stdout), raw: result.stdout });
+  } catch (error) {
+    return toolError(error);
+  }
+});
+
+server.registerTool("guest_file_exists", {
+  title: "Guest File Exists",
+  description: "Check whether a file exists inside the guest OS through VMware Tools.",
+  inputSchema: {
+    vmxPath: vmxSchema(),
+    ...GUEST_CREDENTIALS,
+    guestPath: z.string().min(1).describe("File path inside the guest OS.")
+  },
+  annotations: { readOnlyHint: true, openWorldHint: false }
+}, async ({ vmxPath, guestUser, guestPassword, guestPath }) => {
+  try {
+    await runVmrun([
+      ...guestAuthArgs({ guestUser, guestPassword }),
+      "fileExistsInGuest",
+      pathForVmrun(vmxPath),
+      guestPath
+    ]);
+    return text({ exists: true, guestPath });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/does not exist|not found|Unable to check/i.test(message)) {
+      return text({ exists: false, guestPath, message });
+    }
+    return toolError(error);
+  }
+});
+
+server.registerTool("guest_directory_exists", {
+  title: "Guest Directory Exists",
+  description: "Check whether a directory exists inside the guest OS through VMware Tools.",
+  inputSchema: {
+    vmxPath: vmxSchema(),
+    ...GUEST_CREDENTIALS,
+    guestPath: z.string().min(1).describe("Directory path inside the guest OS.")
+  },
+  annotations: { readOnlyHint: true, openWorldHint: false }
+}, async ({ vmxPath, guestUser, guestPassword, guestPath }) => {
+  try {
+    await runVmrun([
+      ...guestAuthArgs({ guestUser, guestPassword }),
+      "directoryExistsInGuest",
+      pathForVmrun(vmxPath),
+      guestPath
+    ]);
+    return text({ exists: true, guestPath });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/does not exist|not found|Unable to check/i.test(message)) {
+      return text({ exists: false, guestPath, message });
+    }
+    return toolError(error);
+  }
+});
+
+server.registerTool("copy_file_from_guest", {
+  title: "Copy File From Guest",
+  description: "Copy a file from the guest OS to the host through VMware Tools.",
+  inputSchema: {
+    vmxPath: vmxSchema(),
+    ...GUEST_CREDENTIALS,
+    guestPath: z.string().min(1).describe("Source file path inside the guest OS."),
+    hostPath: z.string().min(1).describe("Destination path on the host. WSL /mnt/c paths are accepted.")
+  },
+  annotations: { destructiveHint: false, openWorldHint: false }
+}, async ({ vmxPath, guestUser, guestPassword, guestPath, hostPath }) => {
+  try {
+    const result = await runVmrun([
+      ...guestAuthArgs({ guestUser, guestPassword }),
+      "copyFileFromGuestToHost",
+      pathForVmrun(vmxPath),
+      guestPath,
+      pathForVmrun(hostPath)
+    ]);
+    return text({ ok: true, stdout: result.stdout });
+  } catch (error) {
+    return toolError(error);
+  }
+});
+
+server.registerTool("copy_file_to_guest", {
+  title: "Copy File To Guest",
+  description: "Copy a file from the host to the guest OS through VMware Tools.",
+  inputSchema: {
+    vmxPath: vmxSchema(),
+    ...GUEST_CREDENTIALS,
+    hostPath: z.string().min(1).describe("Source path on the host. WSL /mnt/c paths are accepted."),
+    guestPath: z.string().min(1).describe("Destination file path inside the guest OS.")
+  },
+  annotations: { destructiveHint: true, openWorldHint: false }
+}, async ({ vmxPath, guestUser, guestPassword, hostPath, guestPath }) => {
+  try {
+    const result = await runVmrun([
+      ...guestAuthArgs({ guestUser, guestPassword }),
+      "copyFileFromHostToGuest",
+      pathForVmrun(vmxPath),
+      pathForVmrun(hostPath),
+      guestPath
+    ]);
     return text({ ok: true, stdout: result.stdout });
   } catch (error) {
     return toolError(error);
