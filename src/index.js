@@ -18,6 +18,10 @@ const GUEST_CREDENTIALS = {
   guestUser: z.string().min(1).describe("Guest OS username."),
   guestPassword: z.string().min(1).describe("Guest OS password.")
 };
+const VM_REF = {
+  vmxPath: z.string().min(1).optional().describe("Path to a .vmx file. WSL /mnt/c paths are accepted."),
+  vmName: z.string().min(1).optional().describe("VM alias, matching the .vmx basename or VMX displayName.")
+};
 
 function detectWsl() {
   if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) {
@@ -57,6 +61,10 @@ function wslPathToWindows(path) {
 
 function pathForVmrun(path) {
   return isWsl ? wslPathToWindows(path) : path;
+}
+
+function pathForHost(path) {
+  return isWsl ? windowsPathToWsl(path) : path;
 }
 
 function executableCandidates() {
@@ -288,6 +296,59 @@ function parseGuestDirectory(output) {
     .filter(Boolean);
 }
 
+function envList(name) {
+  return (process.env[name] ?? "")
+    .split(/[,:;]/)
+    .map(value => value.trim())
+    .filter(Boolean);
+}
+
+function envPathList(name) {
+  return (process.env[name] ?? "")
+    .split(delimiter)
+    .map(value => value.trim())
+    .filter(Boolean);
+}
+
+function isTruthyEnv(name) {
+  return ["1", "true", "yes", "on"].includes((process.env[name] ?? "").toLowerCase());
+}
+
+function normalizeForCompare(path) {
+  return pathForHost(path).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+}
+
+function operationPolicy() {
+  return {
+    readonly: isTruthyEnv("VMWARE_MCP_READONLY"),
+    allowedActions: envList("VMWARE_ALLOWED_ACTIONS"),
+    deniedActions: envList("VMWARE_DENIED_ACTIONS"),
+    allowedRoots: envPathList("VMWARE_ALLOWED_ROOTS")
+  };
+}
+
+function enforceOperation({ action, category, mutates = false, vmxPath }) {
+  const policy = operationPolicy();
+  const actionTokens = [action, category].filter(Boolean);
+
+  if (policy.readonly && mutates) {
+    throw new Error(`Operation ${action} is blocked by VMWARE_MCP_READONLY=1.`);
+  }
+  if (policy.deniedActions.some(denied => actionTokens.includes(denied))) {
+    throw new Error(`Operation ${action} is blocked by VMWARE_DENIED_ACTIONS.`);
+  }
+  if (policy.allowedActions.length > 0 && !policy.allowedActions.some(allowed => actionTokens.includes(allowed))) {
+    throw new Error(`Operation ${action} is not allowed by VMWARE_ALLOWED_ACTIONS.`);
+  }
+  if (vmxPath && policy.allowedRoots.length > 0) {
+    const normalizedPath = normalizeForCompare(vmxPath);
+    const allowed = policy.allowedRoots.some(root => normalizedPath.startsWith(`${normalizeForCompare(root)}/`) || normalizedPath === normalizeForCompare(root));
+    if (!allowed) {
+      throw new Error(`VM path is outside VMWARE_ALLOWED_ROOTS: ${pathForHost(vmxPath)}`);
+    }
+  }
+}
+
 function configuredRoots() {
   if (process.env.VMWARE_VMX_ROOTS) {
     return process.env.VMWARE_VMX_ROOTS.split(delimiter).filter(Boolean);
@@ -355,6 +416,50 @@ async function discoverVms(roots, maxDepth) {
   return [...new Set(results)].sort();
 }
 
+async function readVmxConfig(vmxPath) {
+  const hostPath = pathForHost(vmxPath);
+  const raw = await readFile(hostPath, "utf8");
+  return { hostPath, config: parseVmx(raw) };
+}
+
+async function resolveVmReference({ vmxPath, vmName }) {
+  if (vmxPath) {
+    return pathForHost(vmxPath);
+  }
+  if (!vmName) {
+    throw new Error("Specify either vmxPath or vmName.");
+  }
+
+  const roots = configuredRoots();
+  const maxDepth = Number(process.env.VMWARE_DISCOVERY_DEPTH ?? 7);
+  const vmxFiles = await discoverVms(roots, maxDepth);
+  const wanted = vmName.toLowerCase();
+  const matches = [];
+  for (const candidate of vmxFiles) {
+    const baseName = basename(candidate, ".vmx").toLowerCase();
+    if (baseName === wanted) {
+      matches.push({ vmxPath: candidate, match: "basename" });
+      continue;
+    }
+    try {
+      const { config } = await readVmxConfig(candidate);
+      if ((config.displayName ?? "").toLowerCase() === wanted) {
+        matches.push({ vmxPath: candidate, match: "displayName" });
+      }
+    } catch {
+      // Ignore unreadable candidates during alias resolution.
+    }
+  }
+
+  if (matches.length === 0) {
+    throw new Error(`No VM matched vmName "${vmName}". Use find_vms to inspect available aliases.`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`VM name "${vmName}" is ambiguous: ${matches.map(match => match.vmxPath).join(", ")}`);
+  }
+  return pathForHost(matches[0].vmxPath);
+}
+
 async function safeListRunningVms() {
   try {
     const result = await runVmrun(["list"]);
@@ -366,6 +471,53 @@ async function safeListRunningVms() {
 
 function vmxSchema(description = "Path to a .vmx file. WSL /mnt/c paths are accepted.") {
   return z.string().min(1).describe(description);
+}
+
+async function vmDetails(vmxPath, options = {}) {
+  const hostPath = pathForHost(vmxPath);
+  const runningVms = options.runningVms ?? await safeListRunningVms();
+  const summary = vmSummary(hostPath, runningVms);
+  let configSummary;
+  try {
+    const { config } = await readVmxConfig(hostPath);
+    configSummary = {
+      displayName: config.displayName,
+      guestOS: config.guestOS,
+      memsize: config.memsize,
+      numvcpus: config.numvcpus,
+      firmware: config.firmware,
+      ethernet0ConnectionType: config["ethernet0.connectionType"]
+    };
+  } catch (error) {
+    configSummary = { error: error instanceof Error ? error.message : String(error) };
+  }
+
+  const details = { ...summary, config: configSummary };
+  if (options.includeSnapshots) {
+    try {
+      const result = await runVmrun(["listSnapshots", pathForVmrun(hostPath)]);
+      details.snapshots = parseSnapshots(result.stdout);
+    } catch (error) {
+      details.snapshotsError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  if (options.includeGuestIp && summary.running) {
+    try {
+      const result = await runVmrun(["getGuestIPAddress", pathForVmrun(hostPath)]);
+      details.guestIpAddress = result.stdout;
+    } catch (error) {
+      details.guestIpAddressError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  if (options.includeToolsState && summary.running) {
+    try {
+      const result = await runVmrun(["checkToolsState", pathForVmrun(hostPath)]);
+      details.toolsState = result.stdout;
+    } catch (error) {
+      details.toolsStateError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  return details;
 }
 
 const server = new McpServer({
@@ -386,6 +538,7 @@ server.registerTool("server_info", {
       isWsl,
       isWindows,
       searchRoots: configuredRoots(),
+      operationPolicy: operationPolicy(),
       vmrunType: process.env.VMRUN_TYPE ?? "ws",
       vmrunUsePowershell: vmrun ? usePowershellBridge(vmrun) : false,
       powershellPath: vmrun && usePowershellBridge(vmrun) ? powershellPath() : undefined,
@@ -405,22 +558,49 @@ server.registerTool("find_vms", {
   },
   annotations: { readOnlyHint: true, openWorldHint: false }
 }, async ({ roots, maxDepth }) => {
-  const scanRoots = roots?.length ? roots : configuredRoots();
-  const vms = await discoverVms(scanRoots, maxDepth);
-  const runningVms = await safeListRunningVms();
-  return text({ roots: scanRoots, count: vms.length, vms: vms.map(vmxPath => vmSummary(vmxPath, runningVms)) });
+  try {
+    enforceOperation({ action: "find_vms", category: "read" });
+    const scanRoots = roots?.length ? roots : configuredRoots();
+    const vms = await discoverVms(scanRoots, maxDepth);
+    const runningVms = await safeListRunningVms();
+    return text({ roots: scanRoots, count: vms.length, vms: vms.map(vmxPath => vmSummary(vmxPath, runningVms)) });
+  } catch (error) {
+    return toolError(error);
+  }
 });
 
 server.registerTool("get_vm_status", {
   title: "Get VM Status",
   description: "Show whether a VM is running and return basic path information.",
-  inputSchema: { vmxPath: vmxSchema() },
+  inputSchema: { ...VM_REF },
   annotations: { readOnlyHint: true, openWorldHint: false }
-}, async ({ vmxPath }) => {
+}, async ({ vmxPath, vmName }) => {
   try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "get_vm_status", category: "read", vmxPath: resolvedVmxPath });
     const result = await runVmrun(["list"]);
     const runningVms = parseRunningVms(result.stdout);
-    return text({ ...vmSummary(vmxPath, runningVms), runningVms });
+    return text({ ...vmSummary(resolvedVmxPath, runningVms), runningVms });
+  } catch (error) {
+    return toolError(error);
+  }
+});
+
+server.registerTool("get_vm_details", {
+  title: "Get VM Details",
+  description: "Return VM alias/path info, VMX metadata, optional snapshots, guest IP, and Tools state.",
+  inputSchema: {
+    ...VM_REF,
+    includeSnapshots: z.boolean().default(true),
+    includeGuestIp: z.boolean().default(false),
+    includeToolsState: z.boolean().default(false)
+  },
+  annotations: { readOnlyHint: true, openWorldHint: false }
+}, async ({ vmxPath, vmName, includeSnapshots, includeGuestIp, includeToolsState }) => {
+  try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "get_vm_details", category: "read", vmxPath: resolvedVmxPath });
+    return text(await vmDetails(resolvedVmxPath, { includeSnapshots, includeGuestIp, includeToolsState }));
   } catch (error) {
     return toolError(error);
   }
@@ -430,15 +610,15 @@ server.registerTool("read_vmx_config", {
   title: "Read VMX Config",
   description: "Read selected metadata from a VMX file without starting the VM.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     includeAll: z.boolean().default(false).describe("Return all parsed VMX keys. Defaults to a concise summary.")
   },
   annotations: { readOnlyHint: true, openWorldHint: false }
-}, async ({ vmxPath, includeAll }) => {
+}, async ({ vmxPath, vmName, includeAll }) => {
   try {
-    const hostPath = isWsl ? windowsPathToWsl(vmxPath) : vmxPath;
-    const raw = await readFile(hostPath, "utf8");
-    const config = parseVmx(raw);
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "read_vmx_config", category: "read", vmxPath: resolvedVmxPath });
+    const { hostPath, config } = await readVmxConfig(resolvedVmxPath);
     const summary = {
       displayName: config.displayName,
       guestOS: config.guestOS,
@@ -461,6 +641,7 @@ server.registerTool("list_running_vms", {
   annotations: { readOnlyHint: true, openWorldHint: false }
 }, async () => {
   try {
+    enforceOperation({ action: "list_running_vms", category: "read" });
     const result = await runVmrun(["list"]);
     return text({ count: parseRunningVms(result.stdout).length, vms: parseRunningVms(result.stdout), raw: result.stdout });
   } catch (error) {
@@ -472,13 +653,15 @@ server.registerTool("start_vm", {
   title: "Start VM",
   description: "Start a VMware VM.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     mode: z.enum(["gui", "nogui"]).default("gui")
   },
   annotations: { destructiveHint: false, openWorldHint: false }
-}, async ({ vmxPath, mode }) => {
+}, async ({ vmxPath, vmName, mode }) => {
   try {
-    const result = await runVmrun(["start", pathForVmrun(vmxPath), mode]);
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "start_vm", category: "power", mutates: true, vmxPath: resolvedVmxPath });
+    const result = await runVmrun(["start", pathForVmrun(resolvedVmxPath), mode]);
     return text({ ok: true, stdout: result.stdout });
   } catch (error) {
     return toolError(error);
@@ -489,13 +672,15 @@ server.registerTool("stop_vm", {
   title: "Stop VM",
   description: "Stop a VMware VM.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     mode: SOFT_HARD.default("soft")
   },
   annotations: { destructiveHint: true, openWorldHint: false }
-}, async ({ vmxPath, mode }) => {
+}, async ({ vmxPath, vmName, mode }) => {
   try {
-    const result = await runVmrun(["stop", pathForVmrun(vmxPath), mode]);
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "stop_vm", category: "power", mutates: true, vmxPath: resolvedVmxPath });
+    const result = await runVmrun(["stop", pathForVmrun(resolvedVmxPath), mode]);
     return text({ ok: true, stdout: result.stdout });
   } catch (error) {
     return toolError(error);
@@ -506,13 +691,15 @@ server.registerTool("suspend_vm", {
   title: "Suspend VM",
   description: "Suspend a VMware VM.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     mode: SOFT_HARD.default("soft")
   },
   annotations: { destructiveHint: false, openWorldHint: false }
-}, async ({ vmxPath, mode }) => {
+}, async ({ vmxPath, vmName, mode }) => {
   try {
-    const result = await runVmrun(["suspend", pathForVmrun(vmxPath), mode]);
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "suspend_vm", category: "power", mutates: true, vmxPath: resolvedVmxPath });
+    const result = await runVmrun(["suspend", pathForVmrun(resolvedVmxPath), mode]);
     return text({ ok: true, stdout: result.stdout });
   } catch (error) {
     return toolError(error);
@@ -523,13 +710,15 @@ server.registerTool("reset_vm", {
   title: "Reset VM",
   description: "Reset a VMware VM.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     mode: SOFT_HARD.default("soft")
   },
   annotations: { destructiveHint: true, openWorldHint: false }
-}, async ({ vmxPath, mode }) => {
+}, async ({ vmxPath, vmName, mode }) => {
   try {
-    const result = await runVmrun(["reset", pathForVmrun(vmxPath), mode]);
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "reset_vm", category: "power", mutates: true, vmxPath: resolvedVmxPath });
+    const result = await runVmrun(["reset", pathForVmrun(resolvedVmxPath), mode]);
     return text({ ok: true, stdout: result.stdout });
   } catch (error) {
     return toolError(error);
@@ -539,11 +728,13 @@ server.registerTool("reset_vm", {
 server.registerTool("pause_vm", {
   title: "Pause VM",
   description: "Pause a running VMware VM.",
-  inputSchema: { vmxPath: vmxSchema() },
+  inputSchema: { ...VM_REF },
   annotations: { destructiveHint: false, openWorldHint: false }
-}, async ({ vmxPath }) => {
+}, async ({ vmxPath, vmName }) => {
   try {
-    const result = await runVmrun(["pause", pathForVmrun(vmxPath)]);
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "pause_vm", category: "power", mutates: true, vmxPath: resolvedVmxPath });
+    const result = await runVmrun(["pause", pathForVmrun(resolvedVmxPath)]);
     return text({ ok: true, stdout: result.stdout });
   } catch (error) {
     return toolError(error);
@@ -553,11 +744,13 @@ server.registerTool("pause_vm", {
 server.registerTool("unpause_vm", {
   title: "Unpause VM",
   description: "Unpause a VMware VM.",
-  inputSchema: { vmxPath: vmxSchema() },
+  inputSchema: { ...VM_REF },
   annotations: { destructiveHint: false, openWorldHint: false }
-}, async ({ vmxPath }) => {
+}, async ({ vmxPath, vmName }) => {
   try {
-    const result = await runVmrun(["unpause", pathForVmrun(vmxPath)]);
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "unpause_vm", category: "power", mutates: true, vmxPath: resolvedVmxPath });
+    const result = await runVmrun(["unpause", pathForVmrun(resolvedVmxPath)]);
     return text({ ok: true, stdout: result.stdout });
   } catch (error) {
     return toolError(error);
@@ -568,13 +761,15 @@ server.registerTool("list_snapshots", {
   title: "List Snapshots",
   description: "List snapshots for a VMware VM.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     showTree: z.boolean().default(false)
   },
   annotations: { readOnlyHint: true, openWorldHint: false }
-}, async ({ vmxPath, showTree }) => {
+}, async ({ vmxPath, vmName, showTree }) => {
   try {
-    const args = ["listSnapshots", pathForVmrun(vmxPath)];
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "list_snapshots", category: "read", vmxPath: resolvedVmxPath });
+    const args = ["listSnapshots", pathForVmrun(resolvedVmxPath)];
     if (showTree) {
       args.push("showTree");
     }
@@ -589,13 +784,15 @@ server.registerTool("create_snapshot", {
   title: "Create Snapshot",
   description: "Create a snapshot for a VMware VM.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     name: z.string().min(1).describe("Snapshot name.")
   },
   annotations: { destructiveHint: false, openWorldHint: false }
-}, async ({ vmxPath, name }) => {
+}, async ({ vmxPath, vmName, name }) => {
   try {
-    const result = await runVmrun(["snapshot", pathForVmrun(vmxPath), name]);
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "create_snapshot", category: "snapshot", mutates: true, vmxPath: resolvedVmxPath });
+    const result = await runVmrun(["snapshot", pathForVmrun(resolvedVmxPath), name]);
     return text({ ok: true, stdout: result.stdout });
   } catch (error) {
     return toolError(error);
@@ -606,13 +803,15 @@ server.registerTool("revert_to_snapshot", {
   title: "Revert To Snapshot",
   description: "Revert a VMware VM to a snapshot.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     name: z.string().min(1).describe("Snapshot name.")
   },
   annotations: { destructiveHint: true, openWorldHint: false }
-}, async ({ vmxPath, name }) => {
+}, async ({ vmxPath, vmName, name }) => {
   try {
-    const result = await runVmrun(["revertToSnapshot", pathForVmrun(vmxPath), name]);
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "revert_to_snapshot", category: "snapshot", mutates: true, vmxPath: resolvedVmxPath });
+    const result = await runVmrun(["revertToSnapshot", pathForVmrun(resolvedVmxPath), name]);
     return text({ ok: true, stdout: result.stdout });
   } catch (error) {
     return toolError(error);
@@ -623,13 +822,139 @@ server.registerTool("delete_snapshot", {
   title: "Delete Snapshot",
   description: "Delete a VMware VM snapshot.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     name: z.string().min(1).describe("Snapshot name.")
   },
   annotations: { destructiveHint: true, openWorldHint: false }
-}, async ({ vmxPath, name }) => {
+}, async ({ vmxPath, vmName, name }) => {
   try {
-    const result = await runVmrun(["deleteSnapshot", pathForVmrun(vmxPath), name]);
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "delete_snapshot", category: "snapshot", mutates: true, vmxPath: resolvedVmxPath });
+    const result = await runVmrun(["deleteSnapshot", pathForVmrun(resolvedVmxPath), name]);
+    return text({ ok: true, stdout: result.stdout });
+  } catch (error) {
+    return toolError(error);
+  }
+});
+
+server.registerTool("get_guest_ip_address", {
+  title: "Get Guest IP Address",
+  description: "Get the guest OS IP address through VMware Tools.",
+  inputSchema: {
+    ...VM_REF,
+    wait: z.boolean().default(false).describe("Wait for an IP address if VMware Tools supports it.")
+  },
+  annotations: { readOnlyHint: true, openWorldHint: false }
+}, async ({ vmxPath, vmName, wait }) => {
+  try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "get_guest_ip_address", category: "read", vmxPath: resolvedVmxPath });
+    const args = ["getGuestIPAddress", pathForVmrun(resolvedVmxPath)];
+    if (wait) {
+      args.push("-wait");
+    }
+    const result = await runVmrun(args);
+    return text({ ipAddress: result.stdout });
+  } catch (error) {
+    return toolError(error);
+  }
+});
+
+server.registerTool("check_tools_state", {
+  title: "Check Tools State",
+  description: "Check the VMware Tools state for a VM.",
+  inputSchema: { ...VM_REF },
+  annotations: { readOnlyHint: true, openWorldHint: false }
+}, async ({ vmxPath, vmName }) => {
+  try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "check_tools_state", category: "read", vmxPath: resolvedVmxPath });
+    const result = await runVmrun(["checkToolsState", pathForVmrun(resolvedVmxPath)]);
+    return text({ toolsState: result.stdout });
+  } catch (error) {
+    return toolError(error);
+  }
+});
+
+server.registerTool("enable_shared_folders", {
+  title: "Enable Shared Folders",
+  description: "Enable VMware shared folders for a VM.",
+  inputSchema: {
+    ...VM_REF,
+    runtime: z.boolean().default(false).describe("Enable only for the current VM runtime session.")
+  },
+  annotations: { destructiveHint: false, openWorldHint: false }
+}, async ({ vmxPath, vmName, runtime }) => {
+  try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "enable_shared_folders", category: "shared_folder", mutates: true, vmxPath: resolvedVmxPath });
+    const args = ["enableSharedFolders", pathForVmrun(resolvedVmxPath)];
+    if (runtime) {
+      args.push("runtime");
+    }
+    const result = await runVmrun(args);
+    return text({ ok: true, stdout: result.stdout });
+  } catch (error) {
+    return toolError(error);
+  }
+});
+
+server.registerTool("disable_shared_folders", {
+  title: "Disable Shared Folders",
+  description: "Disable VMware shared folders for a VM.",
+  inputSchema: {
+    ...VM_REF,
+    runtime: z.boolean().default(false).describe("Disable only for the current VM runtime session.")
+  },
+  annotations: { destructiveHint: true, openWorldHint: false }
+}, async ({ vmxPath, vmName, runtime }) => {
+  try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "disable_shared_folders", category: "shared_folder", mutates: true, vmxPath: resolvedVmxPath });
+    const args = ["disableSharedFolders", pathForVmrun(resolvedVmxPath)];
+    if (runtime) {
+      args.push("runtime");
+    }
+    const result = await runVmrun(args);
+    return text({ ok: true, stdout: result.stdout });
+  } catch (error) {
+    return toolError(error);
+  }
+});
+
+server.registerTool("add_shared_folder", {
+  title: "Add Shared Folder",
+  description: "Add a host-guest shared folder to a VM.",
+  inputSchema: {
+    ...VM_REF,
+    shareName: z.string().min(1).describe("Shared folder name visible to the guest."),
+    hostPath: z.string().min(1).describe("Host directory path. WSL /mnt/c paths are accepted.")
+  },
+  annotations: { destructiveHint: false, openWorldHint: false }
+}, async ({ vmxPath, vmName, shareName, hostPath }) => {
+  try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "add_shared_folder", category: "shared_folder", mutates: true, vmxPath: resolvedVmxPath });
+    const result = await runVmrun(["addSharedFolder", pathForVmrun(resolvedVmxPath), shareName, pathForVmrun(hostPath)]);
+    return text({ ok: true, stdout: result.stdout });
+  } catch (error) {
+    return toolError(error);
+  }
+});
+
+server.registerTool("remove_shared_folder", {
+  title: "Remove Shared Folder",
+  description: "Remove a host-guest shared folder from a VM.",
+  inputSchema: {
+    ...VM_REF,
+    shareName: z.string().min(1).describe("Shared folder name.")
+  },
+  annotations: { destructiveHint: true, openWorldHint: false }
+}, async ({ vmxPath, vmName, shareName }) => {
+  try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "remove_shared_folder", category: "shared_folder", mutates: true, vmxPath: resolvedVmxPath });
+    const result = await runVmrun(["removeSharedFolder", pathForVmrun(resolvedVmxPath), shareName]);
     return text({ ok: true, stdout: result.stdout });
   } catch (error) {
     return toolError(error);
@@ -640,7 +965,7 @@ server.registerTool("guest_run_program", {
   title: "Run Program In Guest",
   description: "Run a program inside the guest OS through VMware Tools.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     ...GUEST_CREDENTIALS,
     programPath: z.string().min(1).describe("Program path inside the guest OS."),
     arguments: z.array(z.string()).default([]).describe("Arguments passed to the guest program."),
@@ -650,8 +975,10 @@ server.registerTool("guest_run_program", {
     timeoutMs: z.number().int().min(1000).max(900000).optional()
   },
   annotations: { destructiveHint: true, openWorldHint: false }
-}, async ({ vmxPath, guestUser, guestPassword, programPath, arguments: programArgs, noWait, activeWindow, interactive, timeoutMs }) => {
+}, async ({ vmxPath, vmName, guestUser, guestPassword, programPath, arguments: programArgs, noWait, activeWindow, interactive, timeoutMs }) => {
   try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "guest_run_program", category: "guest", mutates: true, vmxPath: resolvedVmxPath });
     const flags = [];
     if (noWait) {
       flags.push("-noWait");
@@ -665,7 +992,7 @@ server.registerTool("guest_run_program", {
     const result = await runVmrun([
       ...guestAuthArgs({ guestUser, guestPassword }),
       "runProgramInGuest",
-      pathForVmrun(vmxPath),
+      pathForVmrun(resolvedVmxPath),
       ...flags,
       programPath,
       ...programArgs
@@ -680,16 +1007,18 @@ server.registerTool("guest_list_processes", {
   title: "List Guest Processes",
   description: "List processes inside the guest OS through VMware Tools.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     ...GUEST_CREDENTIALS
   },
   annotations: { readOnlyHint: true, openWorldHint: false }
-}, async ({ vmxPath, guestUser, guestPassword }) => {
+}, async ({ vmxPath, vmName, guestUser, guestPassword }) => {
   try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "guest_list_processes", category: "guest_read", vmxPath: resolvedVmxPath });
     const result = await runVmrun([
       ...guestAuthArgs({ guestUser, guestPassword }),
       "listProcessesInGuest",
-      pathForVmrun(vmxPath)
+      pathForVmrun(resolvedVmxPath)
     ]);
     return text({ raw: result.stdout });
   } catch (error) {
@@ -701,13 +1030,15 @@ server.registerTool("capture_screen", {
   title: "Capture Screen",
   description: "Capture the VM screen to a host image file.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     hostPath: z.string().min(1).describe("Destination image path on the host. WSL /mnt/c paths are accepted.")
   },
   annotations: { readOnlyHint: true, openWorldHint: false }
-}, async ({ vmxPath, hostPath }) => {
+}, async ({ vmxPath, vmName, hostPath }) => {
   try {
-    const result = await runVmrun(["captureScreen", pathForVmrun(vmxPath), pathForVmrun(hostPath)]);
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "capture_screen", category: "read", vmxPath: resolvedVmxPath });
+    const result = await runVmrun(["captureScreen", pathForVmrun(resolvedVmxPath), pathForVmrun(hostPath)]);
     return text({ ok: true, hostPath, vmrunHostPath: pathForVmrun(hostPath), stdout: result.stdout });
   } catch (error) {
     return toolError(error);
@@ -718,17 +1049,19 @@ server.registerTool("guest_list_directory", {
   title: "List Guest Directory",
   description: "List a directory inside the guest OS through VMware Tools.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     ...GUEST_CREDENTIALS,
     guestPath: z.string().min(1).describe("Directory path inside the guest OS.")
   },
   annotations: { readOnlyHint: true, openWorldHint: false }
-}, async ({ vmxPath, guestUser, guestPassword, guestPath }) => {
+}, async ({ vmxPath, vmName, guestUser, guestPassword, guestPath }) => {
   try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "guest_list_directory", category: "guest_read", vmxPath: resolvedVmxPath });
     const result = await runVmrun([
       ...guestAuthArgs({ guestUser, guestPassword }),
       "listDirectoryInGuest",
-      pathForVmrun(vmxPath),
+      pathForVmrun(resolvedVmxPath),
       guestPath
     ]);
     return text({ entries: parseGuestDirectory(result.stdout), raw: result.stdout });
@@ -741,17 +1074,19 @@ server.registerTool("guest_file_exists", {
   title: "Guest File Exists",
   description: "Check whether a file exists inside the guest OS through VMware Tools.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     ...GUEST_CREDENTIALS,
     guestPath: z.string().min(1).describe("File path inside the guest OS.")
   },
   annotations: { readOnlyHint: true, openWorldHint: false }
-}, async ({ vmxPath, guestUser, guestPassword, guestPath }) => {
+}, async ({ vmxPath, vmName, guestUser, guestPassword, guestPath }) => {
   try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "guest_file_exists", category: "guest_read", vmxPath: resolvedVmxPath });
     await runVmrun([
       ...guestAuthArgs({ guestUser, guestPassword }),
       "fileExistsInGuest",
-      pathForVmrun(vmxPath),
+      pathForVmrun(resolvedVmxPath),
       guestPath
     ]);
     return text({ exists: true, guestPath });
@@ -768,17 +1103,19 @@ server.registerTool("guest_directory_exists", {
   title: "Guest Directory Exists",
   description: "Check whether a directory exists inside the guest OS through VMware Tools.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     ...GUEST_CREDENTIALS,
     guestPath: z.string().min(1).describe("Directory path inside the guest OS.")
   },
   annotations: { readOnlyHint: true, openWorldHint: false }
-}, async ({ vmxPath, guestUser, guestPassword, guestPath }) => {
+}, async ({ vmxPath, vmName, guestUser, guestPassword, guestPath }) => {
   try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "guest_directory_exists", category: "guest_read", vmxPath: resolvedVmxPath });
     await runVmrun([
       ...guestAuthArgs({ guestUser, guestPassword }),
       "directoryExistsInGuest",
-      pathForVmrun(vmxPath),
+      pathForVmrun(resolvedVmxPath),
       guestPath
     ]);
     return text({ exists: true, guestPath });
@@ -795,18 +1132,20 @@ server.registerTool("copy_file_from_guest", {
   title: "Copy File From Guest",
   description: "Copy a file from the guest OS to the host through VMware Tools.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     ...GUEST_CREDENTIALS,
     guestPath: z.string().min(1).describe("Source file path inside the guest OS."),
     hostPath: z.string().min(1).describe("Destination path on the host. WSL /mnt/c paths are accepted.")
   },
   annotations: { destructiveHint: false, openWorldHint: false }
-}, async ({ vmxPath, guestUser, guestPassword, guestPath, hostPath }) => {
+}, async ({ vmxPath, vmName, guestUser, guestPassword, guestPath, hostPath }) => {
   try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "copy_file_from_guest", category: "file_transfer", mutates: true, vmxPath: resolvedVmxPath });
     const result = await runVmrun([
       ...guestAuthArgs({ guestUser, guestPassword }),
       "copyFileFromGuestToHost",
-      pathForVmrun(vmxPath),
+      pathForVmrun(resolvedVmxPath),
       guestPath,
       pathForVmrun(hostPath)
     ]);
@@ -820,18 +1159,20 @@ server.registerTool("copy_file_to_guest", {
   title: "Copy File To Guest",
   description: "Copy a file from the host to the guest OS through VMware Tools.",
   inputSchema: {
-    vmxPath: vmxSchema(),
+    ...VM_REF,
     ...GUEST_CREDENTIALS,
     hostPath: z.string().min(1).describe("Source path on the host. WSL /mnt/c paths are accepted."),
     guestPath: z.string().min(1).describe("Destination file path inside the guest OS.")
   },
   annotations: { destructiveHint: true, openWorldHint: false }
-}, async ({ vmxPath, guestUser, guestPassword, hostPath, guestPath }) => {
+}, async ({ vmxPath, vmName, guestUser, guestPassword, hostPath, guestPath }) => {
   try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "copy_file_to_guest", category: "file_transfer", mutates: true, vmxPath: resolvedVmxPath });
     const result = await runVmrun([
       ...guestAuthArgs({ guestUser, guestPassword }),
       "copyFileFromHostToGuest",
-      pathForVmrun(vmxPath),
+      pathForVmrun(resolvedVmxPath),
       pathForVmrun(hostPath),
       guestPath
     ]);
@@ -851,6 +1192,7 @@ server.registerTool("vmrun", {
   annotations: { destructiveHint: true, openWorldHint: false }
 }, async ({ args, timeoutMs }) => {
   try {
+    enforceOperation({ action: "vmrun", category: "raw", mutates: true });
     const converted = args.map(arg => arg.toLowerCase().endsWith(".vmx") ? pathForVmrun(arg) : arg);
     const result = await runVmrun(converted, { timeoutMs });
     return text({ ok: true, stdout: result.stdout, stderr: result.stderr, command: result.command });

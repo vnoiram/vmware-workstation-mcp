@@ -98,11 +98,57 @@ Windows 側の Node.js で起動する場合は `command` と `args` を Windows
 export VMWARE_VMX_ROOTS="/mnt/c/Users/you/Documents/Virtual Machines:/mnt/d/vms"
 ```
 
+多くの VM 操作ツールは `vmxPath` の代わりに `vmName` も受け付けます。`vmName` は `.vmx` のファイル名、または VMX 内の `displayName` と完全一致する名前です。重複した場合は安全のためエラーになります。
+
+```json
+{
+  "vmName": "Parrot72"
+}
+```
+
+## 安全設定
+
+読み取り専用で起動する場合:
+
+```bash
+export VMWARE_MCP_READONLY=1
+```
+
+操作を細かく許可する場合は `VMWARE_ALLOWED_ACTIONS` を使います。値はカンマ、コロン、セミコロン区切りです。
+
+```bash
+export VMWARE_ALLOWED_ACTIONS="start_vm,stop_vm"
+```
+
+カテゴリ単位でも指定できます。
+
+- `read`: 状態確認、VMX 読み取り、スナップショット一覧、IP 取得など
+- `power`: 起動、停止、サスペンド、リセット、一時停止
+- `snapshot`: スナップショット作成、復元、削除
+- `guest`: ゲスト OS 内でのプログラム実行
+- `guest_read`: ゲスト OS 内のプロセス/ディレクトリ/存在確認
+- `file_transfer`: ホストとゲスト間のファイルコピー
+- `shared_folder`: 共有フォルダの有効化、追加、削除
+- `raw`: `vmrun` escape hatch
+
+特定操作を禁止する場合:
+
+```bash
+export VMWARE_DENIED_ACTIONS="vmrun,delete_snapshot"
+```
+
+操作対象の VMX パスを特定ルート配下に制限する場合:
+
+```bash
+export VMWARE_ALLOWED_ROOTS="/mnt/d/Virtual Machines:/mnt/e/Virtual Machines"
+```
+
 ## 提供ツール
 
 - `server_info`: 検出した `vmrun` と既定検索ルートを表示します。
 - `find_vms`: `.vmx` ファイルを検索し、実行中かどうかも返します。
 - `get_vm_status`: 指定 VM の実行状態とパス情報を表示します。
+- `get_vm_details`: 実行状態、VMX メタデータ、スナップショット、IP、Tools 状態をまとめて表示します。
 - `read_vmx_config`: `.vmx` ファイルから表示名、ゲスト OS、メモリ、CPU などを読み取ります。
 - `list_running_vms`: 実行中 VM を取得します。
 - `start_vm`: VM を起動します。
@@ -115,7 +161,13 @@ export VMWARE_VMX_ROOTS="/mnt/c/Users/you/Documents/Virtual Machines:/mnt/d/vms"
 - `create_snapshot`: スナップショットを作成します。
 - `revert_to_snapshot`: スナップショットへ戻します。
 - `delete_snapshot`: スナップショットを削除します。
+- `get_guest_ip_address`: VMware Tools 経由でゲスト OS の IP アドレスを取得します。
+- `check_tools_state`: VMware Tools の状態を確認します。
 - `capture_screen`: VM の画面をホスト上の画像ファイルに保存します。
+- `enable_shared_folders`: 共有フォルダ機能を有効化します。
+- `disable_shared_folders`: 共有フォルダ機能を無効化します。
+- `add_shared_folder`: ホストディレクトリをゲストへ共有します。
+- `remove_shared_folder`: 共有フォルダを削除します。
 - `guest_run_program`: VMware Tools 経由でゲスト OS 内のプログラムを実行します。
 - `guest_list_processes`: ゲスト OS 内のプロセス一覧を取得します。
 - `guest_list_directory`: ゲスト OS 内のディレクトリを一覧します。
