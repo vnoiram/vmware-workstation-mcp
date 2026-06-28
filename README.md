@@ -45,6 +45,12 @@ npm start
 
 `VMRUN_BRIDGE_HOST` と `VMRUN_BRIDGE_PORT` で bridge の listen 先を変更できます。既定は `127.0.0.1:57931` です。
 
+Windows ログオン時に bridge を自動起動する Task Scheduler 登録例:
+
+```powershell
+.\tools\register-vmrun-bridge-task.ps1 -Token "change-me"
+```
+
 ## MCP クライアント設定例
 
 WSL 側の Node.js で起動する場合:
@@ -106,6 +112,20 @@ export VMWARE_VMX_ROOTS="/mnt/c/Users/you/Documents/Virtual Machines:/mnt/d/vms"
 }
 ```
 
+明示エイリアス、検索ルート、bridge、policy は `vmware-mcp.config.json` にも書けます。雛形は `vmware-mcp.config.example.json` です。別パスを使う場合は `VMWARE_MCP_CONFIG` を指定してください。
+
+```bash
+cp vmware-mcp.config.example.json vmware-mcp.config.json
+export VMWARE_MCP_CONFIG=/path/to/vmware-mcp.config.json
+```
+
+`vmName` 解決は VM 探索結果をキャッシュします。既定 TTL は 300 秒です。
+
+```bash
+export VMWARE_VM_CACHE_TTL_MS=300000
+export VMWARE_DISCOVERY_DEPTH=7
+```
+
 ## 安全設定
 
 読み取り専用で起動する場合:
@@ -129,6 +149,7 @@ export VMWARE_ALLOWED_ACTIONS="start_vm,stop_vm"
 - `guest_read`: ゲスト OS 内のプロセス/ディレクトリ/存在確認
 - `file_transfer`: ホストとゲスト間のファイルコピー
 - `shared_folder`: 共有フォルダの有効化、追加、削除
+- `vmx_edit`: VMX 設定ファイルの編集
 - `raw`: `vmrun` escape hatch
 
 特定操作を禁止する場合:
@@ -143,15 +164,31 @@ export VMWARE_DENIED_ACTIONS="vmrun,delete_snapshot"
 export VMWARE_ALLOWED_ROOTS="/mnt/d/Virtual Machines:/mnt/e/Virtual Machines"
 ```
 
+高リスク操作には `confirm` が必要です。
+
+- `reset_vm`: `confirm: "reset_vm"`
+- `revert_to_snapshot`: `confirm: "revert_to_snapshot"`
+- `delete_snapshot`: `confirm: "delete_snapshot"`
+- `disable_shared_folders`: `confirm: "disable_shared_folders"`
+- `remove_shared_folder`: `confirm: "remove_shared_folder"`
+- `edit_vmx_config`: `confirm: "edit_vmx_config"`
+- `run_guest_program_with_snapshot`: `confirm: "run_guest_program_with_snapshot"`
+- `vmrun`: `confirm: "vmrun"`
+
 ## 提供ツール
 
 - `server_info`: 検出した `vmrun` と既定検索ルートを表示します。
+- `diagnose_environment`: Node/WSL/vmrun/bridge/検索ルート/policy/実行中 VM を診断します。
 - `find_vms`: `.vmx` ファイルを検索し、実行中かどうかも返します。
+- `refresh_vm_cache`: VM 探索キャッシュを更新します。
+- `list_vm_cache`: VM 探索キャッシュを表示します。
 - `get_vm_status`: 指定 VM の実行状態とパス情報を表示します。
 - `get_vm_details`: 実行状態、VMX メタデータ、スナップショット、IP、Tools 状態をまとめて表示します。
 - `read_vmx_config`: `.vmx` ファイルから表示名、ゲスト OS、メモリ、CPU などを読み取ります。
+- `edit_vmx_config`: VMX の表示名、メモリ、CPU、ゲスト OS、ネットワーク種別などを編集します。
 - `list_running_vms`: 実行中 VM を取得します。
 - `start_vm`: VM を起動します。
+- `start_vm_and_wait`: VM 起動後、Tools/IP/任意ポートが使えるまで待ちます。
 - `stop_vm`: VM を停止します。
 - `suspend_vm`: VM をサスペンドします。
 - `reset_vm`: VM をリセットします。
@@ -162,6 +199,7 @@ export VMWARE_ALLOWED_ROOTS="/mnt/d/Virtual Machines:/mnt/e/Virtual Machines"
 - `revert_to_snapshot`: スナップショットへ戻します。
 - `delete_snapshot`: スナップショットを削除します。
 - `get_guest_ip_address`: VMware Tools 経由でゲスト OS の IP アドレスを取得します。
+- `check_guest_port`: ゲスト IP または指定ホストの TCP ポート疎通を確認します。
 - `check_tools_state`: VMware Tools の状態を確認します。
 - `capture_screen`: VM の画面をホスト上の画像ファイルに保存します。
 - `enable_shared_folders`: 共有フォルダ機能を有効化します。
@@ -175,6 +213,7 @@ export VMWARE_ALLOWED_ROOTS="/mnt/d/Virtual Machines:/mnt/e/Virtual Machines"
 - `guest_directory_exists`: ゲスト OS 内のディレクトリ存在確認をします。
 - `copy_file_from_guest`: ゲスト OS からホストへファイルをコピーします。
 - `copy_file_to_guest`: ホストからゲスト OS へファイルをコピーします。
+- `run_guest_program_with_snapshot`: 実行前 snapshot、失敗時 revert、成功時 snapshot 削除を選べるゲスト実行ラッパーです。
 - `vmrun`: 明示した `vmrun` 引数を実行する上級者向けツールです。
 
 ゲスト OS 操作系ツールは VMware Tools がゲスト内で動作しており、ゲスト OS のユーザー名とパスワードを渡せる場合に使えます。

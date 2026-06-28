@@ -2,3 +2,5 @@ node_modules/
 npm-debug.log*
 .DS_Store
 .git-local/
+tools/start-vmrun-bridge-task.ps1
+vmware-mcp.config.json

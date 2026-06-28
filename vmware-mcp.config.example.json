@@ -1,0 +1,28 @@
+{
+  "vmrunType": "ws",
+  "bridge": {
+    "url": "http://127.0.0.1:57931/",
+    "token": "change-me"
+  },
+  "searchRoots": [
+    "/mnt/d/Virtual Machines",
+    "/mnt/e/Virtual Machines"
+  ],
+  "aliases": {
+    "lab": "/mnt/d/Virtual Machines/Parrot72/Parrot72.vmx"
+  },
+  "discoveryDepth": 7,
+  "cache": {
+    "ttlMs": 300000
+  },
+  "policy": {
+    "readonly": false,
+    "allowedActions": [],
+    "deniedActions": [
+      "vmrun"
+    ],
+    "allowedRoots": [
+      "/mnt/d/Virtual Machines"
+    ]
+  }
+}
