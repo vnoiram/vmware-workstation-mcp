@@ -8,7 +8,8 @@
   },
   "scripts": {
     "start": "node ./src/index.js",
-    "bridge": "node ./src/vmrun-bridge.js"
+    "bridge": "node ./src/vmrun-bridge.js",
+    "test": "node --test src/utils.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "file:./modelcontextprotocol-sdk-1.29.0.tgz",

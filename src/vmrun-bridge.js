@@ -5,6 +5,7 @@ import { constants as fsConstants } from "node:fs";
 import { createServer } from "node:http";
 import { platform } from "node:os";
 import { spawn } from "node:child_process";
+import { redactVmrunArgs } from "./utils.js";
 
 const isWindows = platform() === "win32";
 const host = process.env.VMRUN_BRIDGE_HOST ?? "127.0.0.1";
@@ -46,10 +47,6 @@ async function resolveVmrun() {
   throw new Error("vmrun executable was not found. Set VMRUN_PATH.");
 }
 
-function redactVmrunArgs(args) {
-  return args.map((arg, index) => args[index - 1] === "-gp" ? "[redacted]" : arg);
-}
-
 async function readJson(request) {
   const chunks = [];
   for await (const chunk of request) {
@@ -67,9 +64,9 @@ function writeJson(response, statusCode, payload) {
   response.end(JSON.stringify(payload));
 }
 
-function runVmrun(args, timeoutMs) {
-  return new Promise(async (resolve, reject) => {
-    const vmrun = await resolveVmrun();
+async function runVmrun(args, timeoutMs) {
+  const vmrun = await resolveVmrun();
+  return new Promise((resolve, reject) => {
     const child = spawn(vmrun, args, {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]

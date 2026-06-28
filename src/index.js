@@ -10,6 +10,16 @@ import { createConnection } from "node:net";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
+import {
+  windowsPathToWsl,
+  wslPathToWindows,
+  parseVmx,
+  updateVmxText,
+  parseRunningVms,
+  parseSnapshots,
+  redactVmrunArgs,
+  requireConfirmation
+} from "./utils.js";
 
 const isWindows = platform() === "win32";
 const isWsl = !isWindows && detectWsl();
@@ -79,21 +89,6 @@ function toolError(error) {
   return { isError: true, content: [{ type: "text", text: message }] };
 }
 
-function windowsPathToWsl(path) {
-  const match = /^([a-zA-Z]):[\\/](.*)$/.exec(path);
-  if (!match) {
-    return path;
-  }
-  return `/mnt/${match[1].toLowerCase()}/${match[2].replaceAll("\\", "/")}`;
-}
-
-function wslPathToWindows(path) {
-  const match = /^\/mnt\/([a-zA-Z])\/(.*)$/.exec(path);
-  if (!match) {
-    return path;
-  }
-  return `${match[1].toUpperCase()}:\\${match[2].replaceAll("/", "\\")}`;
-}
 
 function pathForVmrun(path) {
   return isWsl ? wslPathToWindows(path) : path;
@@ -173,10 +168,6 @@ function quotePowershell(value) {
 
 function quoteShell(value) {
   return `'${value.replaceAll("'", "'\\''")}'`;
-}
-
-function redactVmrunArgs(args) {
-  return args.map((arg, index) => args[index - 1] === "-gp" ? "[redacted]" : arg);
 }
 
 function bridgeUrl() {
@@ -283,36 +274,6 @@ async function runVmrun(args, options = {}) {
   });
 }
 
-function parseRunningVms(output) {
-  return output
-    .split(/\r?\n/)
-    .map(line => line.trim())
-    .filter(Boolean)
-    .filter(line => !line.toLowerCase().startsWith("total running vms:"));
-}
-
-function parseSnapshots(output) {
-  return output
-    .split(/\r?\n/)
-    .map(line => line.trimEnd())
-    .filter(Boolean)
-    .filter(line => !line.toLowerCase().startsWith("total snapshots:"));
-}
-
-function parseVmx(text) {
-  const config = {};
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) {
-      continue;
-    }
-    const match = /^([^=]+?)\s*=\s*"(.*)"\s*$/.exec(trimmed);
-    if (match) {
-      config[match[1].trim()] = match[2].replace(/\\"/g, "\"");
-    }
-  }
-  return config;
-}
 
 function vmSummary(vmxPath, runningVms = []) {
   const hostPath = isWsl ? windowsPathToWsl(vmxPath) : vmxPath;
@@ -391,11 +352,6 @@ function enforceOperation({ action, category, mutates = false, vmxPath }) {
   }
 }
 
-function requireConfirmation(actual, expected) {
-  if (actual !== expected) {
-    throw new Error(`Confirmation required: set confirm to "${expected}".`);
-  }
-}
 
 function cacheTtlMs() {
   return Number(process.env.VMWARE_VM_CACHE_TTL_MS ?? configValue("cache.ttlMs", 300000));
@@ -500,28 +456,6 @@ async function readVmxConfig(vmxPath) {
   return { hostPath, raw, config: parseVmx(raw) };
 }
 
-function updateVmxText(raw, updates) {
-  const keys = new Set(Object.keys(updates));
-  const seen = new Set();
-  const lines = raw.split(/\r?\n/).map(line => {
-    const match = /^([^=]+?)\s*=/.exec(line.trim());
-    if (!match) {
-      return line;
-    }
-    const key = match[1].trim();
-    if (!keys.has(key)) {
-      return line;
-    }
-    seen.add(key);
-    return `${key} = "${String(updates[key]).replaceAll("\"", "\\\"")}"`;
-  });
-  for (const key of keys) {
-    if (!seen.has(key)) {
-      lines.push(`${key} = "${String(updates[key]).replaceAll("\"", "\\\"")}"`);
-    }
-  }
-  return lines.join("\n");
-}
 
 async function runGuestProgram({ vmxPath, guestUser, guestPassword, programPath, programArgs = [], noWait = false, activeWindow = false, interactive = false, timeoutMs }) {
   const flags = [];
@@ -884,7 +818,9 @@ server.registerTool("edit_vmx_config", {
 }, async ({ vmxPath, vmName, displayName, memoryMb, numVcpus, guestOS, ethernet0ConnectionType, extra, dryRun, confirm }) => {
   try {
     const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
-    requireConfirmation(confirm, "edit_vmx_config");
+    if (!dryRun) {
+      requireConfirmation(confirm, "edit_vmx_config");
+    }
     enforceOperation({ action: "edit_vmx_config", category: "vmx_edit", mutates: !dryRun, vmxPath: resolvedVmxPath });
     const updates = { ...(extra ?? {}) };
     if (displayName !== undefined) updates.displayName = displayName;
@@ -914,7 +850,8 @@ server.registerTool("list_running_vms", {
   try {
     enforceOperation({ action: "list_running_vms", category: "read" });
     const result = await runVmrun(["list"]);
-    return text({ count: parseRunningVms(result.stdout).length, vms: parseRunningVms(result.stdout), raw: result.stdout });
+    const vms = parseRunningVms(result.stdout);
+    return text({ count: vms.length, vms, raw: result.stdout });
   } catch (error) {
     return toolError(error);
   }
