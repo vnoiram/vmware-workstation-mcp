@@ -8,7 +8,11 @@ import {
   parseRunningVms,
   parseSnapshots,
   redactVmrunArgs,
-  requireConfirmation
+  requireConfirmation,
+  normalizePathForCompare,
+  pathsEqual,
+  pathIsInsideRoot,
+  coerceTimeoutMs
 } from "./utils.js";
 
 describe("windowsPathToWsl", () => {
@@ -103,6 +107,10 @@ describe("updateVmxText", () => {
     assert.ok(result.includes('displayName = "X"'));
     assert.ok(result.includes('memsize = "4096"'));
   });
+  it("appends before a single trailing newline", () => {
+    const result = updateVmxText('displayName = "Old"\n', { memsize: "2048" });
+    assert.equal(result, 'displayName = "Old"\nmemsize = "2048"\n');
+  });
 });
 
 describe("parseRunningVms", () => {
@@ -171,5 +179,31 @@ describe("requireConfirmation", () => {
       () => requireConfirmation(undefined, "reset_vm"),
       /Confirmation required.*reset_vm/
     );
+  });
+});
+
+describe("path comparison helpers", () => {
+  it("normalizes separators, case, and trailing slashes", () => {
+    assert.equal(normalizePathForCompare("C:\\VMs\\Demo\\"), "c:/vms/demo");
+  });
+  it("compares Windows paths case-insensitively", () => {
+    assert.equal(pathsEqual("C:\\VMs\\Demo.vmx", "c:/vms/demo.vmx"), true);
+  });
+  it("checks root containment on path boundaries", () => {
+    assert.equal(pathIsInsideRoot("/mnt/d/Virtual Machines/Demo/Demo.vmx", "/mnt/d/Virtual Machines"), true);
+    assert.equal(pathIsInsideRoot("/mnt/d/Virtual Machines 2/Demo.vmx", "/mnt/d/Virtual Machines"), false);
+  });
+});
+
+describe("coerceTimeoutMs", () => {
+  it("returns fallback when value is absent", () => {
+    assert.equal(coerceTimeoutMs(undefined, 5000), 5000);
+  });
+  it("accepts numeric strings", () => {
+    assert.equal(coerceTimeoutMs("3000"), 3000);
+  });
+  it("rejects invalid values", () => {
+    assert.throws(() => coerceTimeoutMs("NaN"), /timeoutMs/);
+    assert.throws(() => coerceTimeoutMs(0), /timeoutMs/);
   });
 });

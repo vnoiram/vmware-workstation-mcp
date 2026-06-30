@@ -44,6 +44,7 @@ npm start
 ```
 
 `VMRUN_BRIDGE_HOST` と `VMRUN_BRIDGE_PORT` で bridge の listen 先を変更できます。既定は `127.0.0.1:57931` です。
+`VMRUN_BRIDGE_MAX_BODY_BYTES` で bridge が受け付ける JSON リクエストサイズ上限を変更できます。既定は `65536` バイトです。
 
 Windows ログオン時に bridge を自動起動する Task Scheduler 登録例:
 
@@ -189,6 +190,7 @@ export VMWARE_ALLOWED_ROOTS="/mnt/d/Virtual Machines:/mnt/e/Virtual Machines"
 - `list_running_vms`: 実行中 VM を取得します。
 - `start_vm`: VM を起動します。
 - `start_vm_and_wait`: VM 起動後、Tools/IP/任意ポートが使えるまで待ちます。
+- `wait_for_guest_ready`: 起動済み VM について、Tools/IP/任意ポートが使えるまで待ちます。
 - `stop_vm`: VM を停止します。
 - `suspend_vm`: VM をサスペンドします。
 - `reset_vm`: VM をリセットします。

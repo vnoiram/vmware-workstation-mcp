@@ -18,7 +18,10 @@ import {
   parseRunningVms,
   parseSnapshots,
   redactVmrunArgs,
-  requireConfirmation
+  requireConfirmation,
+  coerceTimeoutMs,
+  pathsEqual,
+  pathIsInsideRoot
 } from "./utils.js";
 
 const isWindows = platform() === "win32";
@@ -166,10 +169,6 @@ function quotePowershell(value) {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
-function quoteShell(value) {
-  return `'${value.replaceAll("'", "'\\''")}'`;
-}
-
 function bridgeUrl() {
   return process.env.VMRUN_BRIDGE_URL ?? configValue("bridge.url", configValue("bridgeUrl", undefined));
 }
@@ -192,7 +191,7 @@ async function runVmrunBridge(args, options = {}) {
     },
     body: JSON.stringify({
       args,
-      timeoutMs: options.timeoutMs ?? Number(process.env.VMRUN_TIMEOUT_MS ?? 120000)
+      timeoutMs: coerceTimeoutMs(options.timeoutMs ?? process.env.VMRUN_TIMEOUT_MS)
     })
   });
   const payload = await response.json().catch(() => ({}));
@@ -218,10 +217,9 @@ function vmrunInvocation(vmrun, args) {
   const command = `& ${[vmrunWindowsPath, ...args].map(quotePowershell).join(" ")}; exit $LASTEXITCODE`;
   const displayCommand = `& ${[vmrunWindowsPath, ...displayArgs].map(quotePowershell).join(" ")}; exit $LASTEXITCODE`;
   const powershellArgs = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command];
-  const shellCommand = [powershellPath(), ...powershellArgs].map(quoteShell).join(" ");
   return {
-    command: "/bin/sh",
-    args: ["-lc", shellCommand],
+    command: powershellPath(),
+    args: powershellArgs,
     display: [powershellPath(), "-Command", displayCommand]
   };
 }
@@ -235,7 +233,7 @@ async function runVmrun(args, options = {}) {
   const vmrun = await resolveVmrun();
   const invocation = vmrunInvocation(vmrun, finalArgs);
   const displayArgs = redactVmrunArgs(finalArgs);
-  const timeoutMs = options.timeoutMs ?? Number(process.env.VMRUN_TIMEOUT_MS ?? 120000);
+  const timeoutMs = coerceTimeoutMs(options.timeoutMs ?? process.env.VMRUN_TIMEOUT_MS);
 
   return await new Promise((resolve, reject) => {
     const child = spawn(invocation.command, invocation.args, {
@@ -277,12 +275,13 @@ async function runVmrun(args, options = {}) {
 
 function vmSummary(vmxPath, runningVms = []) {
   const hostPath = isWsl ? windowsPathToWsl(vmxPath) : vmxPath;
+  const vmrunPath = pathForVmrun(hostPath);
   return {
     name: basename(hostPath, ".vmx"),
     hostPath,
-    vmrunPath: pathForVmrun(hostPath),
+    vmrunPath,
     directory: dirname(hostPath),
-    running: runningVms.includes(pathForVmrun(hostPath)) || runningVms.includes(hostPath)
+    running: runningVms.some(runningPath => pathsEqual(pathForHost(runningPath), hostPath) || pathsEqual(runningPath, vmrunPath))
   };
 }
 
@@ -317,10 +316,6 @@ function isTruthyEnv(name) {
   return ["1", "true", "yes", "on"].includes((process.env[name] ?? "").toLowerCase());
 }
 
-function normalizeForCompare(path) {
-  return pathForHost(path).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
-}
-
 function operationPolicy() {
   return {
     readonly: isTruthyEnv("VMWARE_MCP_READONLY") || Boolean(configValue("policy.readonly", false)),
@@ -344,8 +339,8 @@ function enforceOperation({ action, category, mutates = false, vmxPath }) {
     throw new Error(`Operation ${action} is not allowed by VMWARE_ALLOWED_ACTIONS.`);
   }
   if (vmxPath && policy.allowedRoots.length > 0) {
-    const normalizedPath = normalizeForCompare(vmxPath);
-    const allowed = policy.allowedRoots.some(root => normalizedPath.startsWith(`${normalizeForCompare(root)}/`) || normalizedPath === normalizeForCompare(root));
+    const hostPath = pathForHost(vmxPath);
+    const allowed = policy.allowedRoots.some(root => pathIsInsideRoot(hostPath, pathForHost(root)));
     if (!allowed) {
       throw new Error(`VM path is outside VMWARE_ALLOWED_ROOTS: ${pathForHost(vmxPath)}`);
     }
@@ -555,6 +550,43 @@ async function safeListRunningVms() {
   } catch {
     return [];
   }
+}
+
+async function waitForVmReadiness(resolvedVmxPath, { waitForTools, waitForIp, port, timeoutMs, intervalMs }) {
+  return await waitForCondition(async () => {
+    const state = { ready: true };
+    if (waitForTools) {
+      try {
+        const tools = await runVmrun(["checkToolsState", pathForVmrun(resolvedVmxPath)]);
+        state.toolsState = tools.stdout;
+        if (!/running|installed/i.test(tools.stdout)) {
+          return { ready: false, message: `tools=${tools.stdout}` };
+        }
+      } catch (error) {
+        return { ready: false, message: error instanceof Error ? error.message : String(error) };
+      }
+    }
+    if (waitForIp || port) {
+      try {
+        const ip = await runVmrun(["getGuestIPAddress", pathForVmrun(resolvedVmxPath)]);
+        state.ipAddress = ip.stdout;
+        if (!ip.stdout) {
+          return { ready: false, message: "guest IP is empty" };
+        }
+      } catch (error) {
+        return { ready: false, message: error instanceof Error ? error.message : String(error) };
+      }
+    }
+    if (port) {
+      const open = await checkPort(state.ipAddress, port, Math.min(intervalMs, 5000));
+      state.port = port;
+      state.portOpen = open;
+      if (!open) {
+        return { ready: false, message: `port ${port} is closed` };
+      }
+    }
+    return state;
+  }, { timeoutMs, intervalMs });
 }
 
 function vmxSchema(description = "Path to a .vmx file. WSL /mnt/c paths are accepted.") {
@@ -894,40 +926,30 @@ server.registerTool("start_vm_and_wait", {
     const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
     enforceOperation({ action: "start_vm_and_wait", category: "power", mutates: true, vmxPath: resolvedVmxPath });
     await runVmrun(["start", pathForVmrun(resolvedVmxPath), mode]);
-    const waitResult = await waitForCondition(async () => {
-      const state = { ready: true, message: "started" };
-      if (waitForTools) {
-        try {
-          const tools = await runVmrun(["checkToolsState", pathForVmrun(resolvedVmxPath)]);
-          state.toolsState = tools.stdout;
-          if (!/running|installed/i.test(tools.stdout)) {
-            return { ready: false, message: `tools=${tools.stdout}` };
-          }
-        } catch (error) {
-          return { ready: false, message: error instanceof Error ? error.message : String(error) };
-        }
-      }
-      if (waitForIp || port) {
-        try {
-          const ip = await runVmrun(["getGuestIPAddress", pathForVmrun(resolvedVmxPath)]);
-          state.ipAddress = ip.stdout;
-          if (!ip.stdout) {
-            return { ready: false, message: "guest IP is empty" };
-          }
-        } catch (error) {
-          return { ready: false, message: error instanceof Error ? error.message : String(error) };
-        }
-      }
-      if (port) {
-        const open = await checkPort(state.ipAddress, port, Math.min(intervalMs, 5000));
-        state.port = port;
-        state.portOpen = open;
-        if (!open) {
-          return { ready: false, message: `port ${port} is closed` };
-        }
-      }
-      return state;
-    }, { timeoutMs, intervalMs });
+    const waitResult = await waitForVmReadiness(resolvedVmxPath, { waitForTools, waitForIp, port, timeoutMs, intervalMs });
+    return text({ ok: true, vmxPath: resolvedVmxPath, ...waitResult });
+  } catch (error) {
+    return toolError(error);
+  }
+});
+
+server.registerTool("wait_for_guest_ready", {
+  title: "Wait For Guest Ready",
+  description: "Wait for an already-started VM to report VMware Tools, guest IP, and optionally a TCP port.",
+  inputSchema: {
+    ...VM_REF,
+    waitForTools: z.boolean().default(true),
+    waitForIp: z.boolean().default(true),
+    port: z.number().int().min(1).max(65535).optional(),
+    timeoutMs: z.number().int().min(1000).max(900000).default(180000),
+    intervalMs: z.number().int().min(500).max(60000).default(3000)
+  },
+  annotations: { readOnlyHint: true, openWorldHint: false }
+}, async ({ vmxPath, vmName, waitForTools, waitForIp, port, timeoutMs, intervalMs }) => {
+  try {
+    const resolvedVmxPath = await resolveVmReference({ vmxPath, vmName });
+    enforceOperation({ action: "wait_for_guest_ready", category: "read", vmxPath: resolvedVmxPath });
+    const waitResult = await waitForVmReadiness(resolvedVmxPath, { waitForTools, waitForIp, port, timeoutMs, intervalMs });
     return text({ ok: true, vmxPath: resolvedVmxPath, ...waitResult });
   } catch (error) {
     return toolError(error);

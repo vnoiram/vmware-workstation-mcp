@@ -14,6 +14,24 @@ export function wslPathToWindows(path) {
   return `${match[1].toUpperCase()}:\\${match[2].replaceAll("/", "\\")}`;
 }
 
+export function normalizePathForCompare(path) {
+  const normalized = String(path)
+    .replaceAll("\\", "/")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+  return normalized || "/";
+}
+
+export function pathsEqual(left, right) {
+  return normalizePathForCompare(left) === normalizePathForCompare(right);
+}
+
+export function pathIsInsideRoot(path, root) {
+  const normalizedPath = normalizePathForCompare(path);
+  const normalizedRoot = normalizePathForCompare(root);
+  return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
+}
+
 export function parseVmx(text) {
   const config = {};
   for (const line of text.split(/\r?\n/)) {
@@ -31,9 +49,10 @@ export function parseVmx(text) {
 
 export function updateVmxText(raw, updates) {
   const eol = raw.includes("\r\n") ? "\r\n" : "\n";
+  const hasTrailingEol = raw.endsWith("\n");
   const keys = new Set(Object.keys(updates));
   const seen = new Set();
-  const lines = raw.split(/\r?\n/).map(line => {
+  const lines = raw.replace(/\r?\n$/, "").split(/\r?\n/).map(line => {
     const match = /^([^=]+?)\s*=/.exec(line.trim());
     if (!match) {
       return line;
@@ -50,7 +69,7 @@ export function updateVmxText(raw, updates) {
       lines.push(`${key} = "${String(updates[key]).replaceAll("\"", "\\\"")}"`);
     }
   }
-  return lines.join(eol);
+  return `${lines.join(eol)}${hasTrailingEol ? eol : ""}`;
 }
 
 export function parseRunningVms(output) {
@@ -77,4 +96,12 @@ export function requireConfirmation(actual, expected) {
   if (actual !== expected) {
     throw new Error(`Confirmation required: set confirm to "${expected}".`);
   }
+}
+
+export function coerceTimeoutMs(value, fallback = 120000, { min = 1000, max = 900000 } = {}) {
+  const timeoutMs = Number(value ?? fallback);
+  if (!Number.isFinite(timeoutMs) || timeoutMs < min || timeoutMs > max) {
+    throw new Error(`timeoutMs must be a number between ${min} and ${max}.`);
+  }
+  return timeoutMs;
 }

@@ -5,12 +5,13 @@ import { constants as fsConstants } from "node:fs";
 import { createServer } from "node:http";
 import { platform } from "node:os";
 import { spawn } from "node:child_process";
-import { redactVmrunArgs } from "./utils.js";
+import { coerceTimeoutMs, redactVmrunArgs } from "./utils.js";
 
 const isWindows = platform() === "win32";
 const host = process.env.VMRUN_BRIDGE_HOST ?? "127.0.0.1";
 const port = Number(process.env.VMRUN_BRIDGE_PORT ?? 57931);
 const token = process.env.VMRUN_BRIDGE_TOKEN;
+const maxBodyBytes = Number(process.env.VMRUN_BRIDGE_MAX_BODY_BYTES ?? 65536);
 
 function executableCandidates() {
   const fromEnv = process.env.VMRUN_PATH ? [process.env.VMRUN_PATH] : [];
@@ -49,7 +50,12 @@ async function resolveVmrun() {
 
 async function readJson(request) {
   const chunks = [];
+  let size = 0;
   for await (const chunk of request) {
+    size += chunk.length;
+    if (size > maxBodyBytes) {
+      throw new Error(`Request body is too large. Limit is ${maxBodyBytes} bytes.`);
+    }
     chunks.push(chunk);
   }
   const raw = Buffer.concat(chunks).toString("utf8");
@@ -66,6 +72,7 @@ function writeJson(response, statusCode, payload) {
 
 async function runVmrun(args, timeoutMs) {
   const vmrun = await resolveVmrun();
+  const effectiveTimeoutMs = coerceTimeoutMs(timeoutMs);
   return new Promise((resolve, reject) => {
     const child = spawn(vmrun, args, {
       windowsHide: true,
@@ -75,8 +82,8 @@ async function runVmrun(args, timeoutMs) {
     let stderr = "";
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
-      reject(new Error(`vmrun timed out after ${timeoutMs} ms: ${redactVmrunArgs(args).join(" ")}`));
-    }, timeoutMs);
+      reject(new Error(`vmrun timed out after ${effectiveTimeoutMs} ms: ${redactVmrunArgs(args).join(" ")}`));
+    }, effectiveTimeoutMs);
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -119,12 +126,24 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    const body = await readJson(request);
+    let body;
+    try {
+      body = await readJson(request);
+    } catch (error) {
+      writeJson(response, 400, { ok: false, error: error instanceof Error ? error.message : String(error) });
+      return;
+    }
     if (!Array.isArray(body.args) || !body.args.every(arg => typeof arg === "string")) {
       writeJson(response, 400, { ok: false, error: "Expected JSON body with string array field: args." });
       return;
     }
-    const timeoutMs = Number(body.timeoutMs ?? process.env.VMRUN_TIMEOUT_MS ?? 120000);
+    let timeoutMs;
+    try {
+      timeoutMs = coerceTimeoutMs(body.timeoutMs ?? process.env.VMRUN_TIMEOUT_MS);
+    } catch (error) {
+      writeJson(response, 400, { ok: false, error: error instanceof Error ? error.message : String(error) });
+      return;
+    }
     const result = await runVmrun(body.args, timeoutMs);
     writeJson(response, 200, { ok: true, ...result });
   } catch (error) {
