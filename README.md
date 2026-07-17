@@ -1,5 +1,7 @@
 # VMware Workstation MCP
 
+English version: [README.en.md](README.en.md)
+
 VMware Workstation を `vmrun` 経由で操作する stdio MCP サーバーです。
 
 このリポジトリは WSL 上に置いて実行できます。VMware Workstation は Windows ホスト側にあり、サーバーは WSL から `vmrun.exe` を起動します。Windows 側の Node.js で直接実行することもできます。
